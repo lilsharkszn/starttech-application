@@ -14,8 +14,8 @@ RUN adduser -D -g '' appuser
 # Copy dependency files first (maximise layer cache)
 COPY go.mod go.sum ./
 
-# Download and verify dependencies
-RUN go mod download && go mod verify
+# Download dependencies
+RUN go mod download
 
 # Copy application source
 COPY . .

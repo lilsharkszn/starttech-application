@@ -1,84 +1,158 @@
 package config
 
 import (
+	"os"
+	"strconv"
 	"strings"
-
-	"github.com/spf13/viper"
 )
 
 // Config stores all configuration of the application.
 type Config struct {
-	ServerPort         string   `mapstructure:"PORT"`
-	MongoURI           string   `mapstructure:"MONGO_URI"`
-	DBName             string   `mapstructure:"DB_NAME"`
-	JWTSecretKey       string   `mapstructure:"JWT_SECRET_KEY"`
-	JWTExpirationHours int      `mapstructure:"JWT_EXPIRATION_HOURS"`
-	EnableCache        bool     `mapstructure:"ENABLE_CACHE"`
-	RedisAddr          string   `mapstructure:"REDIS_ADDR"`
-	RedisPassword      string   `mapstructure:"REDIS_PASSWORD"`
-	LogLevel           string   `mapstructure:"LOG_LEVEL"`
-	LogFormat          string   `mapstructure:"LOG_FORMAT"`
-	CookieDomains      []string `mapstructure:"COOKIE_DOMAINS"`
-	SecureCookie       bool     `mapstructure:"SECURE_COOKIE"`
-	AllowedOrigins     []string `mapstructure:"ALLOWED_ORIGINS"`
+	ServerPort         string
+	MongoURI           string
+	DBName             string
+	JWTSecretKey       string
+	JWTExpirationHours int
+	EnableCache        bool
+	RedisAddr          string
+	RedisPassword      string
+	LogLevel           string
+	LogFormat          string
+	CookieDomains      []string
+	SecureCookie       bool
+	AllowedOrigins     []string
+	RedisTLS           bool
 }
 
-// LoadConfig reads configuration from file or environment variables.
-func LoadConfig(path string) (config Config, err error) {
-	viper.AddConfigPath(path)
-	viper.SetConfigName(".env")
-	viper.SetConfigType("env")
+// helper functions
+func getEnv(key, fallback string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
 
-	viper.AutomaticEnv()
+func getEnvBool(key string, fallback bool) bool {
+	value := os.Getenv(key)
 
-	// Set default values
-	viper.SetDefault("PORT", "8080")
-	viper.SetDefault("ENABLE_CACHE", false)
-	viper.SetDefault("JWT_EXPIRATION_HOURS", 72)
-	viper.SetDefault("COOKIE_DOMAINS", []string{"localhost"})
-	viper.SetDefault("SECURE_COOKIE", false)
-	viper.SetDefault("ALLOWED_ORIGINS", []string{"http://localhost:5173"})
+	if value == "" {
+		return fallback
+	}
 
-	err = viper.ReadInConfig()
+	parsed, err := strconv.ParseBool(value)
 	if err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			return
-		}
+		return fallback
 	}
 
-	err = viper.Unmarshal(&config)
+	return parsed
+}
+
+func getEnvInt(key string, fallback int) int {
+	value := os.Getenv(key)
+
+	if value == "" {
+		return fallback
+	}
+
+	parsed, err := strconv.Atoi(value)
 	if err != nil {
-		return
+		return fallback
 	}
 
-	// Manually handle comma-separated strings for slices if viper didn't split them
-	if allowedOrigins := viper.GetString("ALLOWED_ORIGINS"); allowedOrigins != "" {
-		parts := strings.Split(allowedOrigins, ",")
-		var cleaned []string
-		for _, p := range parts {
-			// Trim spaces and quotes
-			trimmed := strings.TrimSpace(p)
-			trimmed = strings.Trim(trimmed, "\"'")
-			if trimmed != "" {
-				cleaned = append(cleaned, trimmed)
-			}
+	return parsed
+}
+
+func getEnvSlice(key string, fallback []string) []string {
+	value := os.Getenv(key)
+
+	if value == "" {
+		return fallback
+	}
+
+	parts := strings.Split(value, ",")
+
+	var cleaned []string
+
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		trimmed = strings.Trim(trimmed, "\"'")
+		if trimmed != "" {
+			cleaned = append(cleaned, trimmed)
 		}
-		config.AllowedOrigins = cleaned
 	}
 
-	if cookieDomains := viper.GetString("COOKIE_DOMAINS"); cookieDomains != "" {
-		parts := strings.Split(cookieDomains, ",")
-		var cleaned []string
-		for _, p := range parts {
-			// Trim spaces and quotes
-			trimmed := strings.TrimSpace(p)
-			trimmed = strings.Trim(trimmed, "\"'")
-			if trimmed != "" {
-				cleaned = append(cleaned, trimmed)
-			}
-		}
-		config.CookieDomains = cleaned
+	return cleaned
+}
+
+// LoadConfig reads configuration from environment variables.
+func LoadConfig(path string) (Config, error) {
+
+	config := Config{
+		ServerPort: getEnv("PORT", "8080"),
+
+		MongoURI: getEnv(
+			"MONGO_URI",
+			"mongodb://muchtodousr:Password!234@mongodb:27017/?authSource=admin",
+		),
+
+		DBName: getEnv("DB_NAME", "much_todo_db"),
+
+		JWTSecretKey: getEnv(
+			"JWT_SECRET_KEY",
+			"supersecret",
+		),
+
+		JWTExpirationHours: getEnvInt(
+			"JWT_EXPIRATION_HOURS",
+			72,
+		),
+
+		EnableCache: getEnvBool(
+			"ENABLE_CACHE",
+			false,
+		),
+
+		RedisAddr: getEnv(
+			"REDIS_ADDR",
+			"redis:6379",
+		),
+
+		RedisPassword: getEnv(
+			"REDIS_PASSWORD",
+			"",
+		),
+
+		LogLevel: getEnv(
+			"LOG_LEVEL",
+			"INFO",
+		),
+
+		LogFormat: getEnv(
+			"LOG_FORMAT",
+			"json",
+		),
+
+		CookieDomains: getEnvSlice(
+			"COOKIE_DOMAINS",
+			[]string{"localhost"},
+		),
+
+		SecureCookie: getEnvBool(
+			"SECURE_COOKIE",
+			false,
+		),
+
+		AllowedOrigins: getEnvSlice(
+			"ALLOWED_ORIGINS",
+			[]string{"http://localhost:5173"},
+		),
+
+		RedisTLS: getEnvBool(
+			"REDIS_TLS",
+			false,
+		),
 	}
 
-	return
+	return config, nil
 }

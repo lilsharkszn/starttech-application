@@ -36,3 +36,7 @@ docker-compose.test.yaml
 mongodb.key
 mongo-keyfile
 
+*.pem
+*.key
+Server/MuchToDo/.env
+Server/MuchToDo/mongodb.key

@@ -9,6 +9,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/Innocent9712/much-to-do/Server/MuchToDo/internal/config"
+        "crypto/tls"
 )
 
 // Cache defines the interface for a caching service.
@@ -35,15 +36,24 @@ func NewCacheService(cfg config.Config) Cache {
 	}
 
 	log.Println("Caching is enabled. Connecting to Redis...")
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     cfg.RedisAddr,
-		Password: cfg.RedisPassword,
-		DB:       0, // use default DB
-	})
+
+        redisOptions := &redis.Options{
+        Addr:     cfg.RedisAddr,
+        Password: cfg.RedisPassword,
+        DB:       0,
+}
+
+        if cfg.RedisTLS {
+        redisOptions.TLSConfig = &tls.Config{
+                MinVersion: tls.VersionTLS12,
+        }
+}
+
+        rdb := redis.NewClient(redisOptions)
 
 	// Ping Redis to check the connection
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
-		log.Fatalf("Could not connect to Redis: %v. Caching will be disabled.", err)
+		log.Printf("Could not connect to Redis: %v. Caching will be disabled.", err)
 		// Fallback to no-op cache if connection fails
 		return &NoOpCache{}
 	}

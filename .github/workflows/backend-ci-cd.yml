@@ -1,0 +1,264 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Server/**'
+      - '.github/workflows/backend-ci-cd.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Server/**'
+      - '.github/workflows/backend-ci-cd.yml'
+
+env:
+  AWS_REGION: us-east-1
+  GO_VERSION: "1.23"
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  # JOB 1 — Test & Quality Checks
+  # Runs on every push and PR
+  # ─────────────────────────────────────────────────────────
+  test:
+    name: Test & Quality Checks
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: Server/MuchToDo
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: Server/MuchToDo/go.sum
+
+      - name: Install Dependencies
+        run: go mod download
+
+      - name: Go Vet — Static Analysis
+        run: go vet ./...
+
+      - name: Run Unit Tests
+        run: |
+          go test \
+            -v \
+            -race \
+            -coverprofile=coverage.out \
+            -covermode=atomic \
+            ./...
+
+      - name: Upload Coverage Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: Server/MuchToDo/coverage.out
+          retention-days: 7
+
+      - name: Vulnerability Scan — govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 2 — Build Docker Image & Push to ECR
+  # Only runs on push to main after tests pass
+  # ─────────────────────────────────────────────────────────
+  build:
+    name: Build & Push to ECR
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.short_sha }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set Image Metadata
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::8}"
+          IMAGE_URI="${{ secrets.ECR_REPOSITORY_URL }}:${SHORT_SHA}"
+          IMAGE_LATEST="${{ secrets.ECR_REPOSITORY_URL }}:latest"
+          echo "short_sha=$SHORT_SHA"       >> $GITHUB_OUTPUT
+          echo "image_uri=$IMAGE_URI"       >> $GITHUB_OUTPUT
+          echo "image_latest=$IMAGE_LATEST" >> $GITHUB_OUTPUT
+          echo "Building: $IMAGE_URI"
+
+      - name: Build Docker Image
+        working-directory: Server/MuchToDo
+        run: |
+          docker build \
+            --tag ${{ steps.meta.outputs.image_uri }} \
+            --tag ${{ steps.meta.outputs.image_latest }} \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "org.opencontainers.image.source=${{ github.repositoryUrl }}" \
+            .
+
+      - name: Scan Image for Vulnerabilities — Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.image_uri }}
+          format: table
+          exit-code: 1
+          ignore-unfixed: true
+          severity: CRITICAL
+          trivyignores: .trivyignore
+
+      - name: Push Images to ECR
+        run: |
+          docker push ${{ steps.meta.outputs.image_uri }}
+          docker push ${{ steps.meta.outputs.image_latest }}
+          echo "✅ Pushed ${{ steps.meta.outputs.image_uri }}"
+          echo "✅ Pushed ${{ steps.meta.outputs.image_latest }}"
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 3 — Deploy via ASG Rolling Instance Refresh
+  # Only runs after successful build
+  # Requires manual approval via GitHub environment gate
+  # ─────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy — Rolling Update
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get ASG Name
+        id: asg
+        run: |
+          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
+            --query "AutoScalingGroups[?contains(AutoScalingGroupName, 'dev-backend')].AutoScalingGroupName" \
+            --output text)
+          echo "name=$ASG_NAME" >> $GITHUB_OUTPUT
+          echo "Target ASG: $ASG_NAME"
+
+      - name: Start Rolling Instance Refresh
+        id: refresh
+        run: |
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name ${{ steps.asg.outputs.name }} \
+            --preferences '{
+              "MinHealthyPercentage": 50,
+              "InstanceWarmup": 300,
+              "CheckpointDelay": 60
+            }' \
+            --query "InstanceRefreshId" \
+            --output text)
+          echo "refresh_id=$REFRESH_ID" >> $GITHUB_OUTPUT
+          echo "🔄 Started instance refresh: $REFRESH_ID"
+
+      - name: Wait for Instance Refresh to Complete
+        run: |
+          ASG_NAME="${{ steps.asg.outputs.name }}"
+          REFRESH_ID="${{ steps.refresh.outputs.refresh_id }}"
+          MAX_WAIT=900
+          ELAPSED=0
+          echo "Waiting for instance refresh to complete (max ${MAX_WAIT}s)..."
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].Status" \
+              --output text)
+
+            PCT=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].PercentageComplete" \
+              --output text 2>/dev/null || echo "0")
+
+            echo "Status: $STATUS | Progress: ${PCT}% | Elapsed: ${ELAPSED}s"
+
+            if [ "$STATUS" = "Successful" ]; then
+              echo "✅ Instance refresh completed successfully!"
+              exit 0
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "❌ Instance refresh $STATUS"
+              exit 1
+            fi
+
+            sleep 30
+            ELAPSED=$((ELAPSED + 30))
+          done
+
+          echo "❌ Timed out waiting for instance refresh after ${MAX_WAIT}s"
+          exit 1
+
+      - name: Smoke Tests
+        run: |
+          ALB="${{ secrets.ALB_DNS_NAME }}"
+          echo "🔍 Running smoke tests against: http://$ALB"
+
+          # Allow ALB time to fully route to new instances
+          sleep 20
+
+          MAX_RETRIES=5
+          RETRY=0
+
+          while [ $RETRY -lt $MAX_RETRIES ]; do
+            RETRY=$((RETRY + 1))
+            echo "Attempt $RETRY of $MAX_RETRIES..."
+
+            # Test /ping endpoint
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 10 \
+              "http://$ALB/ping")
+
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "✅ /ping returned 200 — smoke test passed!"
+              exit 0
+            fi
+
+            echo "Got HTTP $HTTP_STATUS — retrying in 15s..."
+            sleep 15
+          done
+
+          echo "❌ Smoke tests failed after $MAX_RETRIES attempts"
+          exit 1
+
+      - name: Deployment Summary
+        if: success()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ Backend Deployment Successful!"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Image Tag : ${{ needs.build.outputs.image_tag }}"
+          echo "Image URI : ${{ needs.build.outputs.image_uri }}"
+          echo "ASG       : ${{ steps.asg.outputs.name }}"
+          echo "Commit    : ${{ github.sha }}"
+          echo "Actor     : ${{ github.actor }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

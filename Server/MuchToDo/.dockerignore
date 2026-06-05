@@ -1,0 +1,18 @@
+# Ignore Go build outputs
+muchtodo
+
+# Ignore local environment files
+.env
+.env.local
+.env.*.local
+
+# Ignore editor and system files
+*.swp
+*.swo
+.DS_Store
+.idea
+.vscode
+*.log
+
+# Ignore Go modules cache
+pkg/

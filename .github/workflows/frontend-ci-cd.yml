@@ -1,0 +1,143 @@
+name: Frontend CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Client/**'
+      - '.github/workflows/frontend-ci-cd.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Client/**'
+      - '.github/workflows/frontend-ci-cd.yml'
+
+env:
+  AWS_REGION: us-east-1
+  NODE_VERSION: "20"
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  # JOB 1 — Build & Test
+  # Runs on every push and PR
+  # ─────────────────────────────────────────────────────────
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: Client
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: Client/package-lock.json
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Security Audit
+        run: npm audit --audit-level=high
+        continue-on-error: false
+
+      - name: Build Production Bundle
+        run: npm run build
+        env:
+          # Points the React app at the backend ALB
+          VITE_API_BASE_URL: "http://${{ secrets.ALB_DNS_NAME }}"
+
+      - name: Verify Build Output
+        run: |
+          if [ ! -d "dist" ] || [ -z "$(ls -A dist)" ]; then
+            echo "❌ Build output (dist/) is empty or missing"
+            exit 1
+          fi
+          echo "✅ Build output verified"
+          echo "Files built:"
+          find dist -type f | head -20
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: Client/dist
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 2 — Deploy to S3 + CloudFront Invalidation
+  # Only runs on push to main after build passes
+  # ─────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to S3
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist
+
+      - name: Deploy HTML Files to S3
+        # HTML files must never be cached — browsers always fetch fresh
+        run: |
+          aws s3 sync dist/ s3://${{ secrets.S3_BUCKET_NAME }}/ \
+            --delete \
+            --exclude "*" \
+            --include "*.html" \
+            --cache-control "no-cache, no-store, must-revalidate" \
+            --content-type "text/html"
+          echo "✅ HTML files synced (no-cache)"
+
+      - name: Deploy Static Assets to S3
+        # Vite content-hashes JS/CSS filenames — safe for 1yr immutable cache
+        run: |
+          aws s3 sync dist/ s3://${{ secrets.S3_BUCKET_NAME }}/ \
+            --delete \
+            --exclude "*.html" \
+            --cache-control "public, max-age=31536000, immutable"
+          echo "✅ Static assets synced (1yr cache)"
+
+      - name: Invalidate CloudFront Cache
+        # Only runs if CloudFront distribution ID secret is set
+        env:
+          CF_DIST_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+        if: env.CF_DIST_ID != ''
+        run: |
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*" \
+            --query "Invalidation.Id" \
+            --output text)
+          echo "✅ CloudFront invalidation created: $INVALIDATION_ID"
+
+      - name: Deployment Summary
+        if: success()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ Frontend Deployment Successful!"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "S3 Bucket : ${{ secrets.S3_BUCKET_NAME }}"
+          echo "Commit    : ${{ github.sha }}"
+          echo "Actor     : ${{ github.actor }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

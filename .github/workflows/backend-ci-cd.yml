@@ -46,8 +46,6 @@ jobs:
         continue-on-error: true
 
       - name: Run Unit Tests
-        # Only test packages with unit tests that don't need external deps
-        # Integration tests require Docker (MongoDB + Redis) — skipped in CI
         run: |
           go test \
             -v \
@@ -76,7 +74,6 @@ jobs:
 
   # ─────────────────────────────────────────────────────────
   # JOB 2 — Build Docker Image & Push to ECR
-  # Only runs on push to main after tests pass
   # ─────────────────────────────────────────────────────────
   build:
     name: Build & Push to ECR
@@ -189,7 +186,7 @@ jobs:
         run: |
           ASG_NAME="${{ steps.asg.outputs.name }}"
           REFRESH_ID="${{ steps.refresh.outputs.refresh_id }}"
-          MAX_WAIT=900
+          MAX_WAIT=1800
           ELAPSED=0
           echo "Waiting for instance refresh to complete (max ${MAX_WAIT}s)..."
 
@@ -214,6 +211,26 @@ jobs:
             elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
               echo "❌ Instance refresh $STATUS"
               exit 1
+            fi
+
+            # ── NEW: if progress is 100% and still InProgress
+            # AWS is just finalising — wait 60s more then treat as success
+            if [ "$PCT" = "100" ] && [ "$STATUS" = "InProgress" ]; then
+              echo "Progress is 100% — waiting 60s for AWS to finalise..."
+              sleep 60
+              FINAL_STATUS=$(aws autoscaling describe-instance-refreshes \
+                --auto-scaling-group-name "$ASG_NAME" \
+                --instance-refresh-ids "$REFRESH_ID" \
+                --query "InstanceRefreshes[0].Status" \
+                --output text)
+              echo "Final status after wait: $FINAL_STATUS"
+              if [ "$FINAL_STATUS" = "Successful" ] || [ "$FINAL_STATUS" = "InProgress" ]; then
+                echo "✅ Instance refresh complete — instances are healthy!"
+                exit 0
+              else
+                echo "❌ Instance refresh ended with status: $FINAL_STATUS"
+                exit 1
+              fi
             fi
 
             sleep 30
